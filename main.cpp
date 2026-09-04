@@ -249,8 +249,6 @@ void copy(const fs::path &src, const fs::path &dst, vfile::copy_mode mode)
 
 bool is_stl_header(const fs::path &file_path)
 {
-    if (!file_path.has_extension())
-        return true;
     cfile file(file_path, "rb");
     std::string content = file.read();
     // all MSSTL headers have the following copyright block at the top of the file
@@ -391,7 +389,8 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
             is_intrin = is_intrin || (!msvc_header && filename == "softintrin.h"); // part of the Windows SDK
 
             // MSSTL headers exist only in the immediate (top-level) directory of the include path
-            bool is_stl = !is_intrin && msvc_header && rel.parent_path().empty() && is_stl_header(path);
+            bool is_stl = !is_intrin && msvc_header && rel.parent_path().empty() &&
+                          (!path.has_extension() || is_stl_header(path));
 
             if (is_stl)
             {
