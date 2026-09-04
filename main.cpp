@@ -110,9 +110,10 @@ std::string to_lower_ascii(std::string s)
 
 bool is_c_cxx_source(const fs::path &p)
 {
-    std::string ext{p.extension().string()};
-    return ext.empty() || ext == ".h" || ext == ".c" || ext == ".hpp" || ext == ".cpp" || ext == ".inl" ||
-           ext == ".ixx";
+    std::string ext = p.extension().string();
+    using namespace std::string_view_literals;
+    return ext.empty() || ext == ".h"sv || ext == ".c"sv || ext == ".hpp"sv || ext == ".cpp"sv || ext == ".inl"sv ||
+           ext == ".ixx"sv;
 }
 
 std::string_view skip_space(std::string_view str)
@@ -134,22 +135,29 @@ std::string_view find_include_path(std::string_view line)
     }
     rem.remove_prefix(1);
     rem = skip_space(rem);
-    if (rem.substr(0, 7) != "include")
+    std::string_view kw = "include";
+    if (rem.substr(0, kw.size()) != kw)
     {
         return {};
     }
-    rem.remove_prefix(7);
+    rem.remove_prefix(kw.size());
     rem = skip_space(rem);
     if (rem.empty() || (rem[0] != '<' && rem[0] != '"'))
     {
-        return {};
+        // some MSVC headers uses #include _STL_INTRIN_HEADER
+        std::string_view s = "_STL_INTRIN_HEADER";
+        if (rem.substr(0, s.size()) == s)
+        {
+            return {};
+        }
+        print_and_exit_if(true, "Invalid #include directive: %.*s\n", static_cast<int>(line.size()), line.data());
     }
-    char close = rem[0];
+    char close = rem[0] == '<' ? '>' : '"';
     rem.remove_prefix(1);
     std::size_t close_pos = rem.find(close);
     if (close_pos == std::string_view::npos)
     {
-        return {};
+        print_and_exit_if(true, "Invalid #include directive: %.*s\n", static_cast<int>(line.size()), line.data());
     }
     return rem.substr(0, close_pos);
 }
@@ -188,22 +196,21 @@ void copy(const fs::path &src, const fs::path &dst, vfile::copy_mode mode)
             lowercase_path_inplace(content, find_include_path(line));
         }
 
+        // the line is modified in place
         out.write(line);
         out.write("\n");
 
         if (end == std::string_view::npos)
+        {
             break;
-
+        }
         remaining.remove_prefix(end);
         std::size_t skip = remaining.find_first_not_of("\r\n");
         if (skip == std::string_view::npos)
         {
             break;
         }
-        else
-        {
-            remaining.remove_prefix(skip);
-        }
+        remaining.remove_prefix(skip);
     }
 }
 
@@ -215,8 +222,8 @@ bool is_stl_header(const fs::path &file_path)
     std::string content = file.read();
     // all MSSTL headers have the following copyright block at the top of the file
     // and all other headers do not have it
-    constexpr std::string_view copyright_block{"// Copyright (c) Microsoft Corporation.\r\n"
-                                               "// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception"};
+    std::string_view copyright_block{"// Copyright (c) Microsoft Corporation.\r\n"
+                                     "// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception"};
     return content.find(copyright_block) != std::string::npos;
 }
 
@@ -307,6 +314,8 @@ void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &src_dir
 
 void add_files(const fs::path &src_dir, vfile &root, vfile::copy_mode mode)
 {
+    // sllow some directories to be missing, because libraries for certain architectures/variants are optional
+    // in particular, ARM libraries have been removed in recent MSVC/WindowsSDK releases
     if (!fs::exists(src_dir))
     {
         std::fprintf(stdout, "Directory %s does not exist, skipping\n", src_dir.string().c_str());
@@ -331,7 +340,8 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
         std::error_code ec;
         if (entry.is_regular_file(ec) && !ec)
         {
-            fs::path rel = entry.path().lexically_relative(src_dir);
+            auto path = entry.path();
+            fs::path rel = path.lexically_relative(src_dir);
             // split the relative path into parts and lowercase them
             std::vector<std::string> parts;
             for (const auto &p : rel)
@@ -339,6 +349,7 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
                 parts.push_back(to_lower_ascii(p.filename().string()));
             }
 
+            // these files is unsupport for clang
             static constexpr std::array<std::string_view, 19> msvc_intrinsics = {
                 "ammintrin.h", "arm64intr.h",   "arm64_neon.h", "arm_intr.h" /* no longer exists in newer versions */,
                 "arm_neon.h",  "emmintrin.h",   "immintrin.h",  "intrin.h",
@@ -346,36 +357,36 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
                 "nmmintrin.h", "pmmintrin.h",   "smmintrin.h",  "tmmintrin.h",
                 "wmmintrin.h", "xmmintrin.h",   "zmmintrin.h"};
 
-            // these files is unsupport for clang
             auto &filename = parts.back();
 
-            // determining intrinsic headers doesn't require opening files, so check that before STL.
+            // determining intrinsic headers doesn't require opening files, so check that before STL
             bool is_intrin = msvc_header && std::find(msvc_intrinsics.begin(), msvc_intrinsics.end(), filename) !=
                                                 msvc_intrinsics.end();
             is_intrin = is_intrin || (!msvc_header && filename == "softintrin.h"); // part of the Windows SDK
 
-            bool is_stl = !is_intrin && msvc_header && is_stl_header(entry.path());
+            // MSSTL headers exist only in the immediate (top-level) directory of the include path
+            bool is_stl = !is_intrin && msvc_header && rel.parent_path().empty() && is_stl_header(path);
 
             if (is_stl)
             {
                 auto &target_root = include_root.subfiles[cxx_pos].subfiles[msstl_pos];
                 // MSSTL do not need to lowercase #include directives, but only normalize line endings to LF.
-                add_file_to_tree_with_parts(target_root, entry.path(), std::move(parts),
+                add_file_to_tree_with_parts(target_root, std::move(path), std::move(parts),
                                             vfile::copy_mode::normalize_text);
             }
             else if (is_intrin)
             {
                 // intrins headers are conflicting with clang, so we put them in a separate directory
                 auto &target_root = include_root.subfiles[intrin_pos];
-                add_file_to_tree_with_parts(target_root, entry.path(), std::move(parts),
+                add_file_to_tree_with_parts(target_root, std::move(path), std::move(parts),
                                             vfile::copy_mode::normalize_text);
             }
             else
             {
                 auto &target_root = include_root;
-                add_file_to_tree_with_parts(target_root, entry.path(), std::move(parts),
-                                            is_c_cxx_source(entry.path()) ? vfile::copy_mode::lowercase_include
-                                                                          : vfile::copy_mode::normal);
+                auto is_source = is_c_cxx_source(path);
+                add_file_to_tree_with_parts(target_root, std::move(path), std::move(parts),
+                                            is_source ? vfile::copy_mode::lowercase_include : vfile::copy_mode::normal);
             }
         }
         print_and_exit_if(ec, "Error accessing file %s: %s\n", entry.path().string().c_str(), ec.message().c_str());
@@ -434,6 +445,7 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
     root.type = vfile::file_type::dir;
     root.name = out.filename().string();
 
+    // create the unix-style subdirectories
     vfile lib_dir;
     lib_dir.type = vfile::file_type::dir;
     lib_dir.name = "lib";
@@ -481,7 +493,7 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
     add_architecture_libs(root.subfiles[lib_pos], msvc, sdklib, lib_mode, "x64", "x86_64");
     add_architecture_libs(root.subfiles[lib_pos], msvc, sdklib, lib_mode, "x86", "i686");
 
-    vfile &modules_node = get_or_create_subdir(root.subfiles[share_pos], "msstl");
+    vfile &modules_node = get_or_create_subdir(root.subfiles[share_pos], "msvcstl");
     add_files(msvc / "modules", modules_node, vfile::copy_mode::normalize_text);
 
     add_include_files(msvc / "include", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, true);
