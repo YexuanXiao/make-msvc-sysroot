@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <utility>
+#include <variant>
 
 namespace fs = std::filesystem;
 
@@ -93,11 +94,43 @@ struct vfile
         normalize_text,   // normalize line endings to LF
         lowercase_include // lowercase #include directives in source files with normalize line endings to LF
     };
-    file_type type{};
-    copy_mode mode{};
-    std::string name{};
-    fs::path source{};
-    std::vector<vfile> subfiles{};
+    struct file_info
+    {
+        fs::path source{};
+        copy_mode mode{};
+    };
+    struct dir_info
+    {
+        std::vector<vfile> subfiles{};
+    };
+    file_type type() const
+    {
+        return std::holds_alternative<file_info>(info) ? file_type::file : file_type::dir;
+    }
+    file_info &file()
+    {
+        return std::get<file_info>(info);
+    }
+    dir_info &dir()
+    {
+        return std::get<dir_info>(info);
+    }
+    static vfile make_file(std::string name, file_info info = {})
+    {
+        vfile v;
+        v.name = std::move(name);
+        v.info = std::move(info);
+        return v;
+    }
+    static vfile make_dir(std::string name, dir_info info = {})
+    {
+        vfile v;
+        v.name = std::move(name);
+        v.info = std::move(info);
+        return v;
+    }
+    std::string name;
+    std::variant<file_info, dir_info> info;
 };
 
 std::string to_lower_ascii(std::string s)
@@ -227,77 +260,71 @@ bool is_stl_header(const fs::path &file_path)
     return content.find(copyright_block) != std::string::npos;
 }
 
-void write_sysroot(const vfile &node, const fs::path &current_path)
+void write_sysroot(vfile &node, const fs::path &current_path)
 {
     std::error_code ec;
-    if (node.type == vfile::file_type::dir)
+    if (node.type() == vfile::file_type::dir)
     {
         fs::create_directory(current_path, ec);
         print_and_exit_if(ec, "Failed to create directory %s: %s\n", current_path.string().c_str(),
                           ec.message().c_str());
-        for (const auto &child : node.subfiles)
+        for (auto &child : node.dir().subfiles)
         {
             write_sysroot(child, current_path / child.name);
         }
         return;
     }
-    switch (node.mode)
+    switch (node.file().mode)
     {
     case vfile::copy_mode::normal:
-        fs::copy_file(node.source, current_path, fs::copy_options::overwrite_existing, ec);
-        print_and_exit_if(ec, "Failed to copy file from %s to %s: %s\n", node.source.string().c_str(),
+        fs::copy_file(node.file().source, current_path, fs::copy_options::overwrite_existing, ec);
+        print_and_exit_if(ec, "Failed to copy file from %s to %s: %s\n", node.file().source.string().c_str(),
                           current_path.string().c_str(), ec.message().c_str());
         break;
     case vfile::copy_mode::create_symlink:
-        fs::create_symlink(fs::absolute(node.source), current_path, ec);
-        print_and_exit_if(ec, "Failed to create symlink from %s to %s: %s\n", node.source.string().c_str(),
+        fs::create_symlink(fs::absolute(node.file().source), current_path, ec);
+        print_and_exit_if(ec, "Failed to create symlink from %s to %s: %s\n", node.file().source.string().c_str(),
                           current_path.string().c_str(), ec.message().c_str());
         break;
     case vfile::copy_mode::normalize_text:
-        copy(node.source, current_path, node.mode);
+        copy(node.file().source, current_path, node.file().mode);
         break;
     case vfile::copy_mode::lowercase_include:
-        copy(node.source, current_path, node.mode);
+        copy(node.file().source, current_path, node.file().mode);
         break;
     }
 }
 
-vfile &get_or_create_subdir(vfile &parent, std::string_view name)
+vfile &get_or_create_subdir(vfile &parent, std::string name)
 {
-    assert(parent.type == vfile::file_type::dir);
-    for (auto &child : parent.subfiles)
+    assert(parent.type() == vfile::file_type::dir);
+    for (auto &child : parent.dir().subfiles)
     {
-        if (child.type == vfile::file_type::dir && child.name == name)
+        if (child.type() == vfile::file_type::dir && child.name == name)
             return child;
     }
-    vfile new_dir;
-    new_dir.type = vfile::file_type::dir;
-    new_dir.name = name;
-    new_dir.mode = vfile::copy_mode::normal;
-    parent.subfiles.push_back(std::move(new_dir));
-    return parent.subfiles.back();
+    vfile new_dir = vfile::make_dir(std::move(name));
+    parent.dir().subfiles.push_back(std::move(new_dir));
+    return parent.dir().subfiles.back();
 }
 
-vfile &get_or_create_subdir_path(vfile &root, const std::vector<std::string> &parts)
+vfile &get_or_create_subdir_path(vfile &root, std::vector<std::string> parts)
 {
     vfile *current = &root;
-    for (const auto &part : parts)
+    for (auto &part : parts)
     {
-        current = &get_or_create_subdir(*current, part);
+        current = &get_or_create_subdir(*current, std::move(part));
     }
     return *current;
 }
 
 void add_file_to_tree(vfile &root, fs::path source_file, std::vector<std::string> path, vfile::copy_mode mode)
 {
-    vfile file_node;
-    file_node.type = vfile::file_type::file;
-    file_node.name = std::move(path.back());
+    vfile::file_info info{std::move(source_file), mode};
+    vfile file_node = vfile::make_file(std::move(path.back()), std::move(info));
     path.pop_back();
-    file_node.source = std::move(source_file);
-    file_node.mode = mode;
-    vfile &parent = get_or_create_subdir_path(root, path);
-    parent.subfiles.push_back(std::move(file_node));
+    vfile &parent = get_or_create_subdir_path(root, std::move(path));
+    parent.dir().subfiles.push_back(std::move(file_node));
 }
 
 void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &src_dir, vfile::copy_mode mode)
@@ -368,14 +395,14 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
 
             if (is_stl)
             {
-                auto &target_root = include_root.subfiles[cxx_pos].subfiles[msstl_pos];
+                auto &target_root = include_root.dir().subfiles[cxx_pos].dir().subfiles[msstl_pos];
                 // MSSTL do not need to lowercase #include directives, but only normalize line endings to LF.
                 add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
             }
             else if (is_intrin)
             {
                 // intrins headers are conflicting with clang, so we put them in a separate directory
-                auto &target_root = include_root.subfiles[intrin_pos];
+                auto &target_root = include_root.dir().subfiles[intrin_pos];
                 add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
             }
             else
@@ -416,14 +443,9 @@ void validate_input(const fs::path &windows_sdk_inc, const fs::path &windows_sdk
 void add_architecture_libs(vfile &lib_ref, const fs::path &msvc, const fs::path &sdklib, vfile::copy_mode lib_mode,
                            std::string_view src_arch, std::string_view dest_arch)
 {
-    vfile arch_dir;
-    arch_dir.type = vfile::file_type::dir;
-    std::string arch_dir_name{dest_arch};
-    // arch-unknown-windows-msvc
-    arch_dir_name += "-unknown-windows-msvc";
-    arch_dir.name = std::move(arch_dir_name);
-    lib_ref.subfiles.push_back(std::move(arch_dir));
-    vfile &arch_node = lib_ref.subfiles.back();
+    vfile arch_dir = vfile::make_dir(std::string(dest_arch) + "-unknown-windows-msvc");
+    lib_ref.dir().subfiles.push_back(std::move(arch_dir));
+    vfile &arch_node = lib_ref.dir().subfiles.back();
 
     add_files(msvc / "lib" / src_arch, arch_node, lib_mode);
     add_files(sdklib / "ucrt" / src_arch, arch_node, lib_mode);
@@ -440,67 +462,52 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
                       vfile::copy_mode lib_mode)
 {
     // root directory of the sysroot, identical to the output directory
-    vfile root;
-    root.type = vfile::file_type::dir;
-    root.name = out.filename().string();
+    vfile root = vfile::make_dir(out.filename().string());
 
     // create the unix-style subdirectories
-    vfile lib_dir;
-    lib_dir.type = vfile::file_type::dir;
-    lib_dir.name = "lib";
-    root.subfiles.push_back(lib_dir);
+    vfile lib_dir = vfile::make_dir("lib");
+    root.dir().subfiles.push_back(std::move(lib_dir));
     std::size_t lib_pos = 0;
 
-    vfile include_dir;
-    include_dir.type = vfile::file_type::dir;
-    include_dir.name = "include";
-    root.subfiles.push_back(include_dir);
+    vfile include_dir = vfile::make_dir("include");
+    root.dir().subfiles.push_back(std::move(include_dir));
     std::size_t include_pos = 1;
 
-    vfile share_dir;
-    share_dir.type = vfile::file_type::dir;
-    share_dir.name = "share";
-    root.subfiles.push_back(share_dir);
+    vfile share_dir = vfile::make_dir("share");
+    root.dir().subfiles.push_back(std::move(share_dir));
     std::size_t share_pos = 2;
 
     // C++ standard library headers, including MSSTL and libc++
-    vfile cxx_dir;
-    cxx_dir.type = vfile::file_type::dir;
-    cxx_dir.name = "c++";
-    cxx_dir.mode = vfile::copy_mode::normal;
-    root.subfiles[include_pos].subfiles.push_back(cxx_dir);
-    std::size_t cxx_pos = root.subfiles[include_pos].subfiles.size() - 1;
+    vfile cxx_dir = vfile::make_dir("c++");
+    root.dir().subfiles[include_pos].dir().subfiles.push_back(std::move(cxx_dir));
+    std::size_t cxx_pos = root.dir().subfiles[include_pos].dir().subfiles.size() - 1;
 
     // MSSTL headers, including implementation headers, which are not part of the public API
-    vfile msstl_dir;
-    msstl_dir.type = vfile::file_type::dir;
-    msstl_dir.name = "msvcstl";
-    msstl_dir.mode = vfile::copy_mode::normal;
-    root.subfiles[include_pos].subfiles[cxx_pos].subfiles.push_back(msstl_dir);
-    std::size_t msstl_pos = root.subfiles[include_pos].subfiles[cxx_pos].subfiles.size() - 1;
+    vfile msstl_dir = vfile::make_dir("msvcstl");
+    root.dir().subfiles[include_pos].dir().subfiles[cxx_pos].dir().subfiles.push_back(std::move(msstl_dir));
+    std::size_t msstl_pos = root.dir().subfiles[include_pos].dir().subfiles[cxx_pos].dir().subfiles.size() - 1;
 
     // these intrinsics headers are confilcting with clang
-    vfile intrin_dir;
-    intrin_dir.type = vfile::file_type::dir;
-    intrin_dir.name = "__msvc_vcruntime_intrinsics";
-    intrin_dir.mode = vfile::copy_mode::normal;
-    root.subfiles[include_pos].subfiles.push_back(intrin_dir);
-    std::size_t intrin_pos = root.subfiles[include_pos].subfiles.size() - 1;
+    vfile intrin_dir = vfile::make_dir("__msvc_vcruntime_intrinsics");
+    root.dir().subfiles[include_pos].dir().subfiles.push_back(std::move(intrin_dir));
+    std::size_t intrin_pos = root.dir().subfiles[include_pos].dir().subfiles.size() - 1;
 
-    add_architecture_libs(root.subfiles[lib_pos], msvc, sdklib, lib_mode, "arm64", "aarch64");
-    add_architecture_libs(root.subfiles[lib_pos], msvc, sdklib, lib_mode, "arm", "arm");
-    add_architecture_libs(root.subfiles[lib_pos], msvc, sdklib, lib_mode, "x64", "x86_64");
-    add_architecture_libs(root.subfiles[lib_pos], msvc, sdklib, lib_mode, "x86", "i686");
+    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "arm64", "aarch64");
+    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "arm", "arm");
+    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "x64", "x86_64");
+    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "x86", "i686");
 
-    vfile &modules_node = get_or_create_subdir(root.subfiles[share_pos], "msvcstl");
+    vfile &modules_node = get_or_create_subdir(root.dir().subfiles[share_pos], "msvcstl");
     add_files(msvc / "modules", modules_node, vfile::copy_mode::normalize_text);
 
-    add_include_files(msvc / "include", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, true, false);
-    add_include_files(sdkinc / "ucrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
-    add_include_files(sdkinc / "um", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
-    add_include_files(sdkinc / "cppwinrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, true);
-    add_include_files(sdkinc / "shared", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
-    add_include_files(sdkinc / "winrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
+    add_include_files(msvc / "include", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, true, false);
+    add_include_files(sdkinc / "ucrt", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
+    add_include_files(sdkinc / "um", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
+    add_include_files(sdkinc / "cppwinrt", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false,
+                      true);
+    add_include_files(sdkinc / "shared", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false,
+                      false);
+    add_include_files(sdkinc / "winrt", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
 
     return root;
 }
