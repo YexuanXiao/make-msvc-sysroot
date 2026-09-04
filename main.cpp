@@ -288,8 +288,7 @@ vfile &get_or_create_subdir_path(vfile &root, const std::vector<std::string> &pa
     return *current;
 }
 
-void add_file_to_tree_with_parts(vfile &root, fs::path source_file, std::vector<std::string> path,
-                                 vfile::copy_mode mode)
+void add_file_to_tree(vfile &root, fs::path source_file, std::vector<std::string> path, vfile::copy_mode mode)
 {
     vfile file_node;
     file_node.type = vfile::file_type::file;
@@ -309,12 +308,12 @@ void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &src_dir
     {
         parts.push_back(to_lower_ascii(p.filename().string()));
     }
-    add_file_to_tree_with_parts(root, std::move(source_file), std::move(parts), mode);
+    add_file_to_tree(root, std::move(source_file), std::move(parts), mode);
 }
 
 void add_files(const fs::path &src_dir, vfile &root, vfile::copy_mode mode)
 {
-    // sllow some directories to be missing, because libraries for certain architectures/variants are optional
+    // allow some directories to be missing, because libraries for certain architectures/variants are optional
     // in particular, ARM libraries have been removed in recent MSVC/WindowsSDK releases
     if (!fs::exists(src_dir))
     {
@@ -333,7 +332,7 @@ void add_files(const fs::path &src_dir, vfile &root, vfile::copy_mode mode)
 }
 
 void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t cxx_pos, std::size_t msstl_pos,
-                       std::size_t intrin_pos, bool msvc_header)
+                       std::size_t intrin_pos, bool msvc_header, bool cppwinrt)
 {
     for (const auto &entry : fs::recursive_directory_iterator(src_dir))
     {
@@ -371,22 +370,22 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
             {
                 auto &target_root = include_root.subfiles[cxx_pos].subfiles[msstl_pos];
                 // MSSTL do not need to lowercase #include directives, but only normalize line endings to LF.
-                add_file_to_tree_with_parts(target_root, std::move(path), std::move(parts),
-                                            vfile::copy_mode::normalize_text);
+                add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
             }
             else if (is_intrin)
             {
                 // intrins headers are conflicting with clang, so we put them in a separate directory
                 auto &target_root = include_root.subfiles[intrin_pos];
-                add_file_to_tree_with_parts(target_root, std::move(path), std::move(parts),
-                                            vfile::copy_mode::normalize_text);
+                add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
             }
             else
             {
                 auto &target_root = include_root;
-                auto is_source = is_c_cxx_source(path);
-                add_file_to_tree_with_parts(target_root, std::move(path), std::move(parts),
-                                            is_source ? vfile::copy_mode::lowercase_include : vfile::copy_mode::normal);
+                // cppwinrt headers are known files that do not need to be processed.
+                // They are typically 60 MiB or 80 MiB depending on the Windows SDK version
+                auto need_normalize = (!cppwinrt) && is_c_cxx_source(path);
+                add_file_to_tree(target_root, std::move(path), std::move(parts),
+                                 need_normalize ? vfile::copy_mode::lowercase_include : vfile::copy_mode::normal);
             }
         }
         print_and_exit_if(ec, "Error accessing file %s: %s\n", entry.path().string().c_str(), ec.message().c_str());
@@ -496,12 +495,12 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
     vfile &modules_node = get_or_create_subdir(root.subfiles[share_pos], "msvcstl");
     add_files(msvc / "modules", modules_node, vfile::copy_mode::normalize_text);
 
-    add_include_files(msvc / "include", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, true);
-    add_include_files(sdkinc / "ucrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false);
-    add_include_files(sdkinc / "um", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false);
-    add_include_files(sdkinc / "cppwinrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false);
-    add_include_files(sdkinc / "shared", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false);
-    add_include_files(sdkinc / "winrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false);
+    add_include_files(msvc / "include", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, true, false);
+    add_include_files(sdkinc / "ucrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
+    add_include_files(sdkinc / "um", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
+    add_include_files(sdkinc / "cppwinrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, true);
+    add_include_files(sdkinc / "shared", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
+    add_include_files(sdkinc / "winrt", root.subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
 
     return root;
 }
