@@ -28,13 +28,13 @@ void print_and_exit_impl(const char *format, ...)
 }
 
 // print an error message and exit if the condition is true
-#define print_and_exit_if(condition, ...)     \
-    do                                        \
-    {                                         \
-        if (condition)                        \
-        {                                     \
-            print_and_exit_impl(__VA_ARGS__); \
-        }                                     \
+#define print_and_exit_if(condition, ...)                                                                              \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (condition)                                                                                                 \
+        {                                                                                                              \
+            print_and_exit_impl(__VA_ARGS__);                                                                          \
+        }                                                                                                              \
     } while (0)
 
 class cfile
@@ -118,7 +118,7 @@ bool is_c_cxx_source(const fs::path &p)
 std::string_view skip_space(std::string_view str)
 {
     std::size_t i = 0;
-    while (str[i] != '\0' && (str[i] == ' ' || str[i] == '\t'))
+    while (i != str.size() && (str[i] == ' ' || str[i] == '\t'))
     {
         ++i;
     }
@@ -296,10 +296,7 @@ void add_file_to_tree_with_parts(vfile &root, fs::path source_file, std::vector<
 
 void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &src_dir, vfile::copy_mode mode)
 {
-    std::error_code ec;
-    fs::path rel = fs::relative(source_file, src_dir, ec);
-    print_and_exit_if(ec, "Failed to get relative path for %s: %s\n", source_file.string().c_str(),
-                      ec.message().c_str());
+    fs::path rel = source_file.lexically_relative(src_dir);
     std::vector<std::string> parts;
     for (const auto &p : rel)
     {
@@ -334,17 +331,13 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
         std::error_code ec;
         if (entry.is_regular_file(ec) && !ec)
         {
-            fs::path rel = fs::relative(entry.path(), src_dir, ec);
-            print_and_exit_if(ec, "Failed to get relative path for %s: %s\n", entry.path().string().c_str(),
-                              ec.message().c_str());
+            fs::path rel = entry.path().lexically_relative(src_dir);
             // split the relative path into parts and lowercase them
             std::vector<std::string> parts;
             for (const auto &p : rel)
             {
                 parts.push_back(to_lower_ascii(p.filename().string()));
             }
-
-            bool is_stl = msvc_header && is_stl_header(entry.path());
 
             static constexpr std::array<std::string_view, 19> msvc_intrinsics = {
                 "ammintrin.h", "arm64intr.h",   "arm64_neon.h", "arm_intr.h" /* no longer exists in newer versions */,
@@ -355,10 +348,13 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
 
             // these files is unsupport for clang
             auto &filename = parts.back();
-            bool is_intrin =
-                msvc_header && !is_stl &&
-                std::find(msvc_intrinsics.begin(), msvc_intrinsics.end(), filename) != msvc_intrinsics.end();
+
+            // determining intrinsic headers doesn't require opening files, so check that before STL.
+            bool is_intrin = msvc_header && std::find(msvc_intrinsics.begin(), msvc_intrinsics.end(), filename) !=
+                                                msvc_intrinsics.end();
             is_intrin = is_intrin || (!msvc_header && filename == "softintrin.h"); // part of the Windows SDK
+
+            bool is_stl = !is_intrin && msvc_header && is_stl_header(entry.path());
 
             if (is_stl)
             {
@@ -398,7 +394,8 @@ void validate_input(const fs::path &windows_sdk_inc, const fs::path &windows_sdk
         !fs::exists(windows_sdk_inc / "um", ec) || !fs::exists(windows_sdk_inc / "cppwinrt", ec) ||
         !fs::exists(windows_sdk_inc / "shared", ec) || !fs::exists(windows_sdk_inc / "winrt", ec))
         print_and_exit_if(
-            true, "Invalid Windows SDK include path: %s, expected subdirectories ucrt, um, cppwinrt, shared, and winrt\n",
+            true,
+            "Invalid Windows SDK include path: %s, expected subdirectories ucrt, um, cppwinrt, shared, and winrt\n",
             windows_sdk_inc.string().c_str());
     if (!fs::exists(build_tool, ec) || !fs::exists(build_tool / "include", ec) || !fs::exists(build_tool / "lib", ec) ||
         !fs::exists(build_tool / "modules", ec))
@@ -531,16 +528,20 @@ int main(int argc, char *argv[])
         symlink = vfile::copy_mode::create_symlink;
     }
 
-    fs::path sdkinc = argv[1];
-    fs::path sdklib = argv[2];
-    fs::path msvc = argv[3];
-    fs::path out = argv[4];
+    std::error_code ec;
+    auto sdkinc = fs::absolute(fs::path(argv[1]), ec);
+    print_and_exit_if(ec, "Failed to get absolute path for %s: %s\n", argv[1], ec.message().c_str());
+    auto sdklib = fs::absolute(fs::path(argv[2]), ec);
+    print_and_exit_if(ec, "Failed to get absolute path for %s: %s\n", argv[2], ec.message().c_str());
+    auto msvc = fs::absolute(fs::path(argv[3]), ec);
+    print_and_exit_if(ec, "Failed to get absolute path for %s: %s\n", argv[3], ec.message().c_str());
+    auto out = fs::absolute(fs::path(argv[4]), ec);
+    print_and_exit_if(ec, "Failed to get absolute path for %s: %s\n", argv[4], ec.message().c_str());
 
     validate_input(sdkinc, sdklib, msvc);
 
     vfile root = make_vfile_tree(out, sdkinc, sdklib, msvc, symlink);
 
-    std::error_code ec;
     fs::remove_all(out, ec);
     print_and_exit_if(ec, "Failed to remove existing output directory %s: %s\n", out.string().c_str(),
                       ec.message().c_str());
