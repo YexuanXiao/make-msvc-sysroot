@@ -650,7 +650,7 @@ int main(int argc, char *argv[])
         }
         else if (std::strcmp(argv[i], "--threads") == 0)
         {
-            print_and_exit_if(i == argc, "Missing argument for --threads\n");
+            print_and_exit_if(i + 1 == argc, "Missing argument for --threads\n");
             auto res = std::from_chars(argv[i + 1], argv[i + 1] + std::strlen(argv[i + 1]), threads_count);
             print_and_exit_if(res.ec != std::errc() || threads_count == 0, "Invalid argument for --threads: %s\n",
                               argv[i + 1]);
