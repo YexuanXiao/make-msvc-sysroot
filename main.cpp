@@ -115,23 +115,24 @@ struct vfile
     {
         return std::get<dir_info>(info);
     }
-    static vfile make_file(std::string name, file_info info = {})
-    {
-        vfile v;
-        v.name = std::move(name);
-        v.info = std::move(info);
-        return v;
-    }
-    static vfile make_dir(std::string name, dir_info info = {})
-    {
-        vfile v;
-        v.name = std::move(name);
-        v.info = std::move(info);
-        return v;
-    }
     std::string name;
     std::variant<file_info, dir_info> info;
 };
+
+static vfile make_file(std::string &&name, vfile::file_info info = {})
+{
+    vfile v;
+    v.name = std::move(name);
+    v.info = std::move(info);
+    return v;
+}
+static vfile make_dir(std::string &&name, vfile::dir_info info = {})
+{
+    vfile v;
+    v.name = std::move(name);
+    v.info = std::move(info);
+    return v;
+}
 
 void to_lower_ascii_impl(char *begin, char *end)
 {
@@ -304,7 +305,7 @@ vfile &get_or_create_subdir(vfile &parent, std::string name)
         if (child.type() == vfile::file_type::dir && child.name == name)
             return child;
     }
-    vfile new_dir = vfile::make_dir(std::move(name));
+    vfile new_dir = make_dir(std::move(name));
     parent.dir().subfiles.push_back(std::move(new_dir));
     return parent.dir().subfiles.back();
 }
@@ -322,7 +323,7 @@ vfile &get_or_create_subdir_path(vfile &root, std::vector<std::string> parts)
 void add_file_to_tree(vfile &root, fs::path source_file, std::vector<std::string> path, vfile::copy_mode mode)
 {
     vfile::file_info info{std::move(source_file), mode};
-    vfile file_node = vfile::make_file(std::move(path.back()), std::move(info));
+    vfile file_node = make_file(std::move(path.back()), std::move(info));
     path.pop_back();
     vfile &parent = get_or_create_subdir_path(root, std::move(path));
     parent.dir().subfiles.push_back(std::move(file_node));
@@ -439,7 +440,7 @@ struct add_architecture_libs_args
 
 void add_architecture_libs(add_architecture_libs_args args, std::string_view src_arch, std::string_view dest_arch)
 {
-    vfile arch_dir = vfile::make_dir(std::string(dest_arch) + "-unknown-windows-msvc");
+    vfile arch_dir = make_dir(std::string(dest_arch) + "-unknown-windows-msvc");
     args.lib_root.dir().subfiles.push_back(std::move(arch_dir));
     vfile &arch_node = args.lib_root.dir().subfiles.back();
 
@@ -458,33 +459,33 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
                       vfile::copy_mode lib_mode)
 {
     // root directory of the sysroot, identical to the output directory
-    vfile root = vfile::make_dir(out.filename().string());
+    vfile root = make_dir(out.filename().string());
 
     // create the unix-style subdirectories
-    vfile lib_dir = vfile::make_dir("lib");
+    vfile lib_dir = make_dir("lib");
     root.dir().subfiles.push_back(std::move(lib_dir));
     std::size_t lib_pos = 0;
 
-    vfile include_dir = vfile::make_dir("include");
+    vfile include_dir = make_dir("include");
     root.dir().subfiles.push_back(std::move(include_dir));
     std::size_t include_pos = 1;
 
-    vfile share_dir = vfile::make_dir("share");
+    vfile share_dir = make_dir("share");
     root.dir().subfiles.push_back(std::move(share_dir));
     std::size_t share_pos = 2;
 
     // C++ standard library headers, including MSSTL and libc++
-    vfile cxx_dir = vfile::make_dir("c++");
+    vfile cxx_dir = make_dir("c++");
     root.dir().subfiles[include_pos].dir().subfiles.push_back(std::move(cxx_dir));
     std::size_t cxx_pos = root.dir().subfiles[include_pos].dir().subfiles.size() - 1;
 
     // MSSTL headers, including implementation headers, which are not part of the public API
-    vfile msstl_dir = vfile::make_dir("msvcstl");
+    vfile msstl_dir = make_dir("msvcstl");
     root.dir().subfiles[include_pos].dir().subfiles[cxx_pos].dir().subfiles.push_back(std::move(msstl_dir));
     std::size_t msstl_pos = root.dir().subfiles[include_pos].dir().subfiles[cxx_pos].dir().subfiles.size() - 1;
 
     // these intrinsics headers are confilcting with clang
-    vfile intrin_dir = vfile::make_dir("__msvc_vcruntime_intrinsics");
+    vfile intrin_dir = make_dir("__msvc_vcruntime_intrinsics");
     root.dir().subfiles[include_pos].dir().subfiles.push_back(std::move(intrin_dir));
     std::size_t intrin_pos = root.dir().subfiles[include_pos].dir().subfiles.size() - 1;
 
