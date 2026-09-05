@@ -28,3 +28,4 @@ make-msvc-sysroot <windows-sdk-inc> <windows-sdk-lib> <build-tool> <output-path>
 | Option | Description |
 |--------|-------------|
 | `--symlink` | Use symbolic links for library files. |
+| `--threads <count>` | Number of threads for processing and writing files. |
