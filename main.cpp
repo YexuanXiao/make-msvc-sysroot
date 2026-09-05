@@ -16,6 +16,8 @@
 #include <cstdarg>
 #include <utility>
 #include <variant>
+#include <thread>
+#include <charconv>
 
 namespace fs = std::filesystem;
 
@@ -196,10 +198,8 @@ std::string_view find_include_path(std::string_view line)
     char close = rem[0] == '<' ? '>' : '"';
     rem.remove_prefix(1);
     std::size_t close_pos = rem.find(close);
-    if (close_pos == std::string_view::npos)
-    {
-        print_and_exit_if(true, "Invalid #include directive: %.*s\n", static_cast<int>(line.size()), line.data());
-    }
+    print_and_exit_if(close_pos == std::string_view::npos, "Invalid #include directive: %.*s\n",
+                      static_cast<int>(line.size()), line.data());
     return rem.substr(0, close_pos);
 }
 
@@ -219,10 +219,9 @@ void copy(const fs::path &src, const fs::path &dst, vfile::copy_mode mode)
 
     cfile in(src, "rb");
     std::string content = in.read();
+    std::string output;
+    output.reserve(content.size());
     std::string_view remaining(content);
-
-    cfile out(dst, "wb");
-
     while (!remaining.empty())
     {
         std::size_t end = remaining.find_first_of("\r\n");
@@ -234,8 +233,8 @@ void copy(const fs::path &src, const fs::path &dst, vfile::copy_mode mode)
         }
 
         // the line is modified in place
-        out.write(line);
-        out.write("\n");
+        output.append(line);
+        output.push_back('\n');
 
         if (end == std::string_view::npos)
         {
@@ -249,6 +248,8 @@ void copy(const fs::path &src, const fs::path &dst, vfile::copy_mode mode)
         }
         remaining.remove_prefix(skip);
     }
+    cfile out(dst, "wb");
+    out.write(output);
 }
 
 bool is_stl_header(const fs::path &file_path)
@@ -262,38 +263,109 @@ bool is_stl_header(const fs::path &file_path)
     return content.find(copyright_block) != std::string::npos;
 }
 
-void write_sysroot(vfile &node, const fs::path &current_path)
+void process_file(vfile &file_node, const fs::path &current_path)
 {
-    std::error_code ec;
-    if (node.type() == vfile::file_type::dir)
+    switch (file_node.file().mode)
     {
-        fs::create_directory(current_path, ec);
-        print_and_exit_if(ec, "Failed to create directory %s: %s\n", current_path.string().c_str(),
-                          ec.message().c_str());
-        for (auto &child : node.dir().subfiles)
-        {
-            write_sysroot(child, current_path / child.name);
-        }
+    case vfile::copy_mode::normal: {
+        std::error_code ec;
+        fs::copy_file(file_node.file().source, current_path, fs::copy_options::overwrite_existing, ec);
+        print_and_exit_if(ec, "Failed to copy file from %s to %s: %s\n", file_node.file().source.string().c_str(),
+                          current_path.string().c_str(), ec.message().c_str());
+        break;
+    }
+    case vfile::copy_mode::create_symlink: {
+        std::error_code ec;
+        fs::create_symlink(fs::absolute(file_node.file().source), current_path, ec);
+        print_and_exit_if(ec, "Failed to create symlink from %s to %s: %s\n", file_node.file().source.string().c_str(),
+                          current_path.string().c_str(), ec.message().c_str());
+        break;
+    }
+    case vfile::copy_mode::normalize_text:
+    case vfile::copy_mode::lowercase_include:
+        copy(file_node.file().source, current_path, file_node.file().mode);
+        break;
+    }
+}
+
+void write_sysroot_seq(vfile &node, const fs::path &current_path)
+{
+    if (node.type() != vfile::file_type::dir)
+    {
+        process_file(node, current_path);
         return;
     }
-    switch (node.file().mode)
+    std::error_code ec;
+    fs::create_directory(current_path, ec);
+    print_and_exit_if(ec, "Failed to create directory %s: %s\n", current_path.string().c_str(), ec.message().c_str());
+    for (auto &child : node.dir().subfiles)
     {
-    case vfile::copy_mode::normal:
-        fs::copy_file(node.file().source, current_path, fs::copy_options::overwrite_existing, ec);
-        print_and_exit_if(ec, "Failed to copy file from %s to %s: %s\n", node.file().source.string().c_str(),
-                          current_path.string().c_str(), ec.message().c_str());
-        break;
-    case vfile::copy_mode::create_symlink:
-        fs::create_symlink(fs::absolute(node.file().source), current_path, ec);
-        print_and_exit_if(ec, "Failed to create symlink from %s to %s: %s\n", node.file().source.string().c_str(),
-                          current_path.string().c_str(), ec.message().c_str());
-        break;
-    case vfile::copy_mode::normalize_text:
-        copy(node.file().source, current_path, node.file().mode);
-        break;
-    case vfile::copy_mode::lowercase_include:
-        copy(node.file().source, current_path, node.file().mode);
-        break;
+        write_sysroot_seq(child, current_path / child.name);
+    }
+}
+
+struct jthread
+{
+    std::thread t;
+    jthread() = default;
+    jthread(std::thread &&other) noexcept
+    {
+        t = std::move(other);
+    }
+    jthread(jthread &&other) noexcept
+    {
+        t = std::move(other.t);
+    }
+    ~jthread()
+    {
+        if (t.joinable())
+            t.join();
+    }
+};
+
+void write_sysroot_par(vfile &node, const fs::path &current_path, std::size_t threads_count)
+{
+    if (node.type() != vfile::file_type::dir)
+    {
+        process_file(node, current_path);
+        return;
+    }
+
+    std::error_code ec;
+    fs::create_directory(current_path, ec);
+    print_and_exit_if(ec, "Failed to create directory %s: %s\n", current_path.string().c_str(), ec.message().c_str());
+
+    auto &subfiles = node.dir().subfiles;
+    vfile *data = subfiles.data();
+    vfile *end = data + subfiles.size();
+
+    while (data != end)
+    {
+        if (data->type() != vfile::file_type::file)
+        {
+            write_sysroot_par(*data, current_path / data->name, threads_count);
+            ++data;
+            continue;
+        }
+
+        vfile *seg_end = std::find_if_not(data, end, [](const vfile &v) { return v.type() == vfile::file_type::file; });
+        size_t seg_len = seg_end - data;
+
+        size_t chunk = (seg_len + threads_count - 1) / threads_count;
+
+        std::vector<jthread> threads;
+        threads.reserve(std::min(threads_count, seg_len));
+
+        for (vfile *p = data; p != seg_end;)
+        {
+            vfile *q = p + std::min<size_t>(chunk, seg_end - p);
+            threads.emplace_back(std::thread([p, q, &current_path]() {
+                std::for_each(p, q, [&current_path](vfile &v) { process_file(v, current_path / v.name); });
+            }));
+            p = q;
+        }
+
+        data = seg_end;
     }
 }
 
@@ -515,21 +587,20 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
 void validate_input(const fs::path &windows_sdk_inc, const fs::path &windows_sdk_lib, const fs::path &build_tool)
 {
     std::error_code ec;
-    if (!fs::exists(windows_sdk_lib, ec) || !fs::exists(windows_sdk_lib / "ucrt", ec) ||
-        !fs::exists(windows_sdk_lib / "um", ec))
-        print_and_exit_if(true, "Invalid Windows SDK lib path: %s, expected subdirectories ucrt and um\n",
-                          windows_sdk_lib.string().c_str());
-    if (!fs::exists(windows_sdk_inc, ec) || !fs::exists(windows_sdk_inc / "ucrt", ec) ||
-        !fs::exists(windows_sdk_inc / "um", ec) || !fs::exists(windows_sdk_inc / "cppwinrt", ec) ||
-        !fs::exists(windows_sdk_inc / "shared", ec) || !fs::exists(windows_sdk_inc / "winrt", ec))
-        print_and_exit_if(
-            true,
-            "Invalid Windows SDK include path: %s, expected subdirectories ucrt, um, cppwinrt, shared, and winrt\n",
-            windows_sdk_inc.string().c_str());
-    if (!fs::exists(build_tool, ec) || !fs::exists(build_tool / "include", ec) || !fs::exists(build_tool / "lib", ec) ||
-        !fs::exists(build_tool / "modules", ec))
-        print_and_exit_if(true, "Invalid MSVC path: %s, expected subdirectories include, lib, and modules\n",
-                          build_tool.string().c_str());
+    print_and_exit_if((!fs::exists(windows_sdk_lib, ec) || !fs::exists(windows_sdk_lib / "ucrt", ec) ||
+                       !fs::exists(windows_sdk_lib / "um", ec)),
+                      "Invalid Windows SDK lib path: %s, expected subdirectories ucrt and um\n",
+                      windows_sdk_lib.string().c_str());
+    print_and_exit_if(
+        (!fs::exists(windows_sdk_inc, ec) || !fs::exists(windows_sdk_inc / "ucrt", ec) ||
+         !fs::exists(windows_sdk_inc / "um", ec) || !fs::exists(windows_sdk_inc / "cppwinrt", ec) ||
+         !fs::exists(windows_sdk_inc / "shared", ec) || !fs::exists(windows_sdk_inc / "winrt", ec)),
+        "Invalid Windows SDK include path: %s, expected subdirectories ucrt, um, cppwinrt, shared, and winrt\n",
+        windows_sdk_inc.string().c_str());
+    print_and_exit_if((!fs::exists(build_tool, ec) || !fs::exists(build_tool / "include", ec) ||
+                       !fs::exists(build_tool / "lib", ec) || !fs::exists(build_tool / "modules", ec)),
+                      "Invalid MSVC path: %s, expected subdirectories include, lib, and modules\n",
+                      build_tool.string().c_str());
 }
 
 void print_usage_and_exit()
@@ -545,25 +616,39 @@ Arguments:
 
 Options:
   --symlink           Use symbolic links for library files.
+  --threads <count>   Number of threads for processing and writing files.
 )");
     std::exit(1);
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc < 5 || argc > 6)
+    if (argc < 5)
     {
         print_usage_and_exit();
     }
 
     vfile::copy_mode symlink{};
-    if (argc == 6)
+    std::size_t threads_count = 1;
+
+    for (auto i = 5; i != argc; ++i)
     {
-        if (std::strcmp(argv[5], "--symlink") != 0)
+        if (std::strcmp(argv[i], "--symlink") == 0)
         {
-            print_usage_and_exit();
+            symlink = vfile::copy_mode::create_symlink;
         }
-        symlink = vfile::copy_mode::create_symlink;
+        else if (std::strcmp(argv[i], "--threads") == 0)
+        {
+            print_and_exit_if(i == argc, "Missing argument for --threads\n");
+            auto res = std::from_chars(argv[i + 1], argv[i + 1] + std::strlen(argv[i + 1]), threads_count);
+            print_and_exit_if(res.ec != std::errc() || threads_count == 0, "Invalid argument for --threads: %s\n",
+                              argv[i + 1]);
+            ++i;
+        }
+        else
+        {
+            print_and_exit_if(true, "Unknown option: %s\n", argv[i]);
+        }
     }
 
     std::error_code ec;
@@ -583,7 +668,14 @@ int main(int argc, char *argv[])
     fs::remove_all(out, ec);
     print_and_exit_if(ec, "Failed to remove existing output directory %s: %s\n", out.string().c_str(),
                       ec.message().c_str());
-    write_sysroot(root, out);
+    if (threads_count == 1)
+    {
+        write_sysroot_seq(root, out);
+    }
+    else
+    {
+        write_sysroot_par(root, out, threads_count);
+    }
 
     cfile readme(out / "README.md", "wb");
     readme.write("This directory was generated by make-msvc-sysroot.\n"
