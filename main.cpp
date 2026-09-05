@@ -133,11 +133,18 @@ struct vfile
     std::variant<file_info, dir_info> info;
 };
 
+void to_lower_ascii_impl(char *begin, char *end)
+{
+    for (char *p = begin; p != end; ++p)
+    {
+        if (*p >= 'A' && *p <= 'Z')
+            *p += 'a' - 'A';
+    }
+}
+
 std::string to_lower_ascii(std::string s)
 {
-    for (auto &c : s)
-        if (c >= 'A' && c <= 'Z')
-            c = c - 'A' + 'a';
+    to_lower_ascii_impl(s.data(), s.data() + s.size());
     return s;
 }
 
@@ -202,11 +209,7 @@ void lowercase_path_inplace(std::string &content, std::string_view path)
 
     char *p = content.data() + (path.data() - content.data());
     char *end = p + path.size();
-    for (; p != end; ++p)
-    {
-        if (*p >= 'A' && *p <= 'Z')
-            *p += 'a' - 'A';
-    }
+    to_lower_ascii_impl(p, end);
 }
 
 void copy(const fs::path &src, const fs::path &dst, vfile::copy_mode mode)
@@ -325,15 +328,20 @@ void add_file_to_tree(vfile &root, fs::path source_file, std::vector<std::string
     parent.dir().subfiles.push_back(std::move(file_node));
 }
 
-void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &src_dir, vfile::copy_mode mode)
+auto make_parts_from_path(const fs::path &path)
 {
-    fs::path rel = source_file.lexically_relative(src_dir);
     std::vector<std::string> parts;
-    for (const auto &p : rel)
+    for (const auto &p : path)
     {
         parts.push_back(to_lower_ascii(p.filename().string()));
     }
-    add_file_to_tree(root, std::move(source_file), std::move(parts), mode);
+    return parts;
+}
+
+void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &src_dir, vfile::copy_mode mode)
+{
+    fs::path rel = source_file.lexically_relative(src_dir);
+    add_file_to_tree(root, std::move(source_file), make_parts_from_path(rel), mode);
 }
 
 void add_files(const fs::path &src_dir, vfile &root, vfile::copy_mode mode)
@@ -374,11 +382,7 @@ void add_include_files(const fs::path &src_dir, add_include_files_args args, boo
             auto path = entry.path();
             fs::path rel = path.lexically_relative(src_dir);
             // split the relative path into parts and lowercase them
-            std::vector<std::string> parts;
-            for (const auto &p : rel)
-            {
-                parts.push_back(to_lower_ascii(p.filename().string()));
-            }
+            auto parts = make_parts_from_path(rel);
 
             // these files is unsupport for clang
             static constexpr std::array<std::string_view, 19> msvc_intrinsics = {
