@@ -356,8 +356,15 @@ void add_files(const fs::path &src_dir, vfile &root, vfile::copy_mode mode)
     }
 }
 
-void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t cxx_pos, std::size_t msstl_pos,
-                       std::size_t intrin_pos, bool msvc_header, bool cppwinrt)
+struct add_include_files_args
+{
+    vfile &include_root;
+    std::size_t cxx_pos;
+    std::size_t msstl_pos;
+    std::size_t intrin_pos;
+};
+
+void add_include_files(const fs::path &src_dir, add_include_files_args args, bool msvc_header, bool cppwinrt)
 {
     for (const auto &entry : fs::recursive_directory_iterator(src_dir))
     {
@@ -394,67 +401,53 @@ void add_include_files(const fs::path &src_dir, vfile &include_root, std::size_t
 
             if (is_stl)
             {
-                auto &target_root = include_root.dir().subfiles[cxx_pos].dir().subfiles[msstl_pos];
+                auto &target_root = args.include_root.dir().subfiles[args.cxx_pos].dir().subfiles[args.msstl_pos];
                 // MSSTL do not need to lowercase #include directives, but only normalize line endings to LF.
                 add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
             }
             else if (is_intrin)
             {
                 // intrins headers are conflicting with clang, so we put them in a separate directory
-                auto &target_root = include_root.dir().subfiles[intrin_pos];
+                auto &target_root = args.include_root.dir().subfiles[args.intrin_pos];
                 add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
             }
             else
             {
-                auto &target_root = include_root;
+                auto &target_root = args.include_root;
                 // cppwinrt headers are known files that do not need to be processed.
                 // They are typically 60 MiB or 80 MiB depending on the Windows SDK version
-                auto need_normalize = (!cppwinrt) && is_c_cxx_source(path);
-                add_file_to_tree(target_root, std::move(path), std::move(parts),
-                                 need_normalize ? vfile::copy_mode::lowercase_include : vfile::copy_mode::normal);
+                auto mode = ((!cppwinrt) && is_c_cxx_source(path)) ? vfile::copy_mode::lowercase_include
+                                                                   : vfile::copy_mode::normal;
+                add_file_to_tree(target_root, std::move(path), std::move(parts), mode);
             }
         }
         print_and_exit_if(ec, "Error accessing file %s: %s\n", entry.path().string().c_str(), ec.message().c_str());
     }
 }
 
-// check if the input paths are legal windows sdk and msvc paths
-void validate_input(const fs::path &windows_sdk_inc, const fs::path &windows_sdk_lib, const fs::path &build_tool)
+struct add_architecture_libs_args
 {
-    std::error_code ec;
-    if (!fs::exists(windows_sdk_lib, ec) || !fs::exists(windows_sdk_lib / "ucrt", ec) ||
-        !fs::exists(windows_sdk_lib / "um", ec))
-        print_and_exit_if(true, "Invalid Windows SDK lib path: %s, expected subdirectories ucrt and um\n",
-                          windows_sdk_lib.string().c_str());
-    if (!fs::exists(windows_sdk_inc, ec) || !fs::exists(windows_sdk_inc / "ucrt", ec) ||
-        !fs::exists(windows_sdk_inc / "um", ec) || !fs::exists(windows_sdk_inc / "cppwinrt", ec) ||
-        !fs::exists(windows_sdk_inc / "shared", ec) || !fs::exists(windows_sdk_inc / "winrt", ec))
-        print_and_exit_if(
-            true,
-            "Invalid Windows SDK include path: %s, expected subdirectories ucrt, um, cppwinrt, shared, and winrt\n",
-            windows_sdk_inc.string().c_str());
-    if (!fs::exists(build_tool, ec) || !fs::exists(build_tool / "include", ec) || !fs::exists(build_tool / "lib", ec) ||
-        !fs::exists(build_tool / "modules", ec))
-        print_and_exit_if(true, "Invalid MSVC path: %s, expected subdirectories include, lib, and modules\n",
-                          build_tool.string().c_str());
-}
+    vfile &lib_root;
+    const fs::path &msvc;
+    const fs::path &sdklib;
+    vfile::copy_mode lib_mode;
+};
 
-void add_architecture_libs(vfile &lib_ref, const fs::path &msvc, const fs::path &sdklib, vfile::copy_mode lib_mode,
-                           std::string_view src_arch, std::string_view dest_arch)
+void add_architecture_libs(add_architecture_libs_args args, std::string_view src_arch, std::string_view dest_arch)
 {
     vfile arch_dir = vfile::make_dir(std::string(dest_arch) + "-unknown-windows-msvc");
-    lib_ref.dir().subfiles.push_back(std::move(arch_dir));
-    vfile &arch_node = lib_ref.dir().subfiles.back();
+    args.lib_root.dir().subfiles.push_back(std::move(arch_dir));
+    vfile &arch_node = args.lib_root.dir().subfiles.back();
 
-    add_files(msvc / "lib" / src_arch, arch_node, lib_mode);
-    add_files(sdklib / "ucrt" / src_arch, arch_node, lib_mode);
-    add_files(sdklib / "um" / src_arch, arch_node, lib_mode);
+    add_files(args.msvc / "lib" / src_arch, arch_node, args.lib_mode);
+    add_files(args.sdklib / "ucrt" / src_arch, arch_node, args.lib_mode);
+    add_files(args.sdklib / "um" / src_arch, arch_node, args.lib_mode);
 
     vfile &onecore_node = get_or_create_subdir(arch_node, "onecore");
-    add_files(msvc / "lib" / "onecore" / src_arch, onecore_node, lib_mode);
+    add_files(args.msvc / "lib" / "onecore" / src_arch, onecore_node, args.lib_mode);
 
     vfile &enclave_node = get_or_create_subdir(arch_node, "enclave");
-    add_files(sdklib / "ucrt_enclave" / src_arch, enclave_node, lib_mode);
+    add_files(args.sdklib / "ucrt_enclave" / src_arch, enclave_node, args.lib_mode);
 }
 
 vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::path &sdklib, const fs::path &msvc,
@@ -491,24 +484,47 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
     root.dir().subfiles[include_pos].dir().subfiles.push_back(std::move(intrin_dir));
     std::size_t intrin_pos = root.dir().subfiles[include_pos].dir().subfiles.size() - 1;
 
-    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "arm64", "aarch64");
-    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "arm", "arm");
-    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "x64", "x86_64");
-    add_architecture_libs(root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode, "x86", "i686");
+    add_architecture_libs_args arch_args{root.dir().subfiles[lib_pos], msvc, sdklib, lib_mode};
+
+    add_architecture_libs(arch_args, "arm64", "aarch64");
+    add_architecture_libs(arch_args, "arm", "arm");
+    add_architecture_libs(arch_args, "x64", "x86_64");
+    add_architecture_libs(arch_args, "x86", "i686");
 
     vfile &modules_node = get_or_create_subdir(root.dir().subfiles[share_pos], "msvcstl");
     add_files(msvc / "modules", modules_node, vfile::copy_mode::normalize_text);
 
-    add_include_files(msvc / "include", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, true, false);
-    add_include_files(sdkinc / "ucrt", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
-    add_include_files(sdkinc / "um", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
-    add_include_files(sdkinc / "cppwinrt", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false,
-                      true);
-    add_include_files(sdkinc / "shared", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false,
-                      false);
-    add_include_files(sdkinc / "winrt", root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos, false, false);
+    add_include_files_args include_args{root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos};
+
+    add_include_files(msvc / "include", include_args, true, false);
+    add_include_files(sdkinc / "ucrt", include_args, false, false);
+    add_include_files(sdkinc / "um", include_args, false, false);
+    add_include_files(sdkinc / "cppwinrt", include_args, false, true);
+    add_include_files(sdkinc / "shared", include_args, false, false);
+    add_include_files(sdkinc / "winrt", include_args, false, false);
 
     return root;
+}
+
+// check if the input paths are legal windows sdk and msvc paths
+void validate_input(const fs::path &windows_sdk_inc, const fs::path &windows_sdk_lib, const fs::path &build_tool)
+{
+    std::error_code ec;
+    if (!fs::exists(windows_sdk_lib, ec) || !fs::exists(windows_sdk_lib / "ucrt", ec) ||
+        !fs::exists(windows_sdk_lib / "um", ec))
+        print_and_exit_if(true, "Invalid Windows SDK lib path: %s, expected subdirectories ucrt and um\n",
+                          windows_sdk_lib.string().c_str());
+    if (!fs::exists(windows_sdk_inc, ec) || !fs::exists(windows_sdk_inc / "ucrt", ec) ||
+        !fs::exists(windows_sdk_inc / "um", ec) || !fs::exists(windows_sdk_inc / "cppwinrt", ec) ||
+        !fs::exists(windows_sdk_inc / "shared", ec) || !fs::exists(windows_sdk_inc / "winrt", ec))
+        print_and_exit_if(
+            true,
+            "Invalid Windows SDK include path: %s, expected subdirectories ucrt, um, cppwinrt, shared, and winrt\n",
+            windows_sdk_inc.string().c_str());
+    if (!fs::exists(build_tool, ec) || !fs::exists(build_tool / "include", ec) || !fs::exists(build_tool / "lib", ec) ||
+        !fs::exists(build_tool / "modules", ec))
+        print_and_exit_if(true, "Invalid MSVC path: %s, expected subdirectories include, lib, and modules\n",
+                          build_tool.string().c_str());
 }
 
 void print_usage_and_exit()
