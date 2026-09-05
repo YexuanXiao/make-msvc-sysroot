@@ -288,16 +288,25 @@ void process_file(vfile &file_node, const fs::path &current_path)
     }
 }
 
-void write_sysroot_seq(vfile &node, const fs::path &current_path)
+vfile::file_type write_sysroot_common(vfile &node, const fs::path &current_path)
 {
     if (node.type() != vfile::file_type::dir)
     {
         process_file(node, current_path);
-        return;
+        return node.type();
     }
     std::error_code ec;
     fs::create_directory(current_path, ec);
     print_and_exit_if(ec, "Failed to create directory %s: %s\n", current_path.string().c_str(), ec.message().c_str());
+    return node.type();
+}
+
+void write_sysroot_seq(vfile &node, const fs::path &current_path)
+{
+    if (write_sysroot_common(node, current_path) != vfile::file_type::dir)
+    {
+        return;
+    }
     for (auto &child : node.dir().subfiles)
     {
         write_sysroot_seq(child, current_path / child.name);
@@ -323,17 +332,13 @@ struct jthread
     }
 };
 
-void write_sysroot_par(vfile &node, const fs::path &current_path, std::size_t threads_count)
+void write_sysroot_par_impl(vfile &node, const fs::path &current_path, std::size_t threads_count,
+                            std::vector<jthread> &threads)
 {
-    if (node.type() != vfile::file_type::dir)
+    if (write_sysroot_common(node, current_path) != vfile::file_type::dir)
     {
-        process_file(node, current_path);
         return;
     }
-
-    std::error_code ec;
-    fs::create_directory(current_path, ec);
-    print_and_exit_if(ec, "Failed to create directory %s: %s\n", current_path.string().c_str(), ec.message().c_str());
 
     auto &subfiles = node.dir().subfiles;
     vfile *data = subfiles.data();
@@ -343,30 +348,50 @@ void write_sysroot_par(vfile &node, const fs::path &current_path, std::size_t th
     {
         if (data->type() != vfile::file_type::file)
         {
-            write_sysroot_par(*data, current_path / data->name, threads_count);
+            write_sysroot_par_impl(*data, current_path / data->name, threads_count, threads);
             ++data;
             continue;
         }
 
         vfile *seg_end = std::find_if_not(data, end, [](const vfile &v) { return v.type() == vfile::file_type::file; });
-        size_t seg_len = seg_end - data;
+        std::size_t seg_len = seg_end - data;
+        std::size_t num_threads = std::min(threads_count, seg_len);
 
-        size_t chunk = (seg_len + threads_count - 1) / threads_count;
+        auto process_one = [&current_path](vfile &v) { process_file(v, current_path / v.name); };
 
-        std::vector<jthread> threads;
-        threads.reserve(std::min(threads_count, seg_len));
-
-        for (vfile *p = data; p != seg_end;)
+        if (num_threads == 1)
         {
-            vfile *q = p + std::min<size_t>(chunk, seg_end - p);
-            threads.emplace_back(std::thread([p, q, &current_path]() {
-                std::for_each(p, q, [&current_path](vfile &v) { process_file(v, current_path / v.name); });
-            }));
-            p = q;
+            std::for_each(data, seg_end, process_one);
+        }
+        else
+        {
+            std::size_t base = seg_len / num_threads;
+            std::size_t remainder = seg_len % num_threads;
+            vfile *p = data;
+
+            for (std::size_t i = 0; i != num_threads; ++i)
+            {
+                std::size_t block_size = base + (i < remainder ? 1 : 0);
+                vfile *block_end = p + block_size;
+
+                threads.emplace_back(
+                    std::thread([p, block_end, &process_one]() { std::for_each(p, block_end, process_one); }));
+
+                p = block_end;
+            }
+
+            threads.clear(); // wait for all threads
         }
 
         data = seg_end;
     }
+}
+
+void write_sysroot_par(vfile &node, const fs::path &current_path, std::size_t threads_count)
+{
+    std::vector<jthread> threads;
+    threads.reserve(threads_count);
+    write_sysroot_par_impl(node, current_path, threads_count, threads);
 }
 
 vfile &get_or_create_subdir(vfile &parent, std::string name)
@@ -382,39 +407,26 @@ vfile &get_or_create_subdir(vfile &parent, std::string name)
     return parent.dir().subfiles.back();
 }
 
-vfile &get_or_create_subdir_path(vfile &root, std::vector<std::string> parts)
+vfile &get_or_create_subdir_path(vfile &root, const fs::path &path)
 {
     vfile *current = &root;
-    for (auto &part : parts)
+    for (const auto &part : path)
     {
-        current = &get_or_create_subdir(*current, std::move(part));
+        std::string name = to_lower_ascii(part.filename().string());
+        current = &get_or_create_subdir(*current, std::move(name));
     }
     return *current;
 }
 
-void add_file_to_tree(vfile &root, fs::path source_file, std::vector<std::string> path, vfile::copy_mode mode)
+void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &rel_path, vfile::copy_mode mode)
 {
+    std::string filename = to_lower_ascii(rel_path.filename().string());
+    fs::path parent_path = rel_path.parent_path();
+    vfile &parent = get_or_create_subdir_path(root, parent_path);
+
     vfile::file_info info{std::move(source_file), mode};
-    vfile file_node = make_file(std::move(path.back()), std::move(info));
-    path.pop_back();
-    vfile &parent = get_or_create_subdir_path(root, std::move(path));
+    vfile file_node = make_file(std::move(filename), std::move(info));
     parent.dir().subfiles.push_back(std::move(file_node));
-}
-
-auto make_parts_from_path(const fs::path &path)
-{
-    std::vector<std::string> parts;
-    for (const auto &p : path)
-    {
-        parts.push_back(to_lower_ascii(p.filename().string()));
-    }
-    return parts;
-}
-
-void add_file_to_tree(vfile &root, fs::path source_file, const fs::path &src_dir, vfile::copy_mode mode)
-{
-    fs::path rel = source_file.lexically_relative(src_dir);
-    add_file_to_tree(root, std::move(source_file), make_parts_from_path(rel), mode);
 }
 
 void add_files(const fs::path &src_dir, vfile &root, vfile::copy_mode mode)
@@ -431,7 +443,9 @@ void add_files(const fs::path &src_dir, vfile &root, vfile::copy_mode mode)
         std::error_code ec;
         if (entry.is_regular_file(ec) && !ec)
         {
-            add_file_to_tree(root, entry.path(), src_dir, mode);
+            fs::path path = entry.path();
+            fs::path rel = path.lexically_relative(src_dir);
+            add_file_to_tree(root, std::move(path), rel, mode);
         }
         print_and_exit_if(ec, "Error accessing file %s: %s\n", entry.path().string().c_str(), ec.message().c_str());
     }
@@ -454,8 +468,7 @@ void add_include_files(const fs::path &src_dir, add_include_files_args args, boo
         {
             auto path = entry.path();
             fs::path rel = path.lexically_relative(src_dir);
-            // split the relative path into parts and lowercase them
-            auto parts = make_parts_from_path(rel);
+            std::string filename_lower = to_lower_ascii(rel.filename().string());
 
             // these files is unsupport for clang
             static constexpr std::array<std::string_view, 19> msvc_intrinsics = {
@@ -465,12 +478,10 @@ void add_include_files(const fs::path &src_dir, add_include_files_args args, boo
                 "nmmintrin.h", "pmmintrin.h",   "smmintrin.h",  "tmmintrin.h",
                 "wmmintrin.h", "xmmintrin.h",   "zmmintrin.h"};
 
-            auto &filename = parts.back();
-
             // determining intrinsic headers doesn't require opening files, so check that before STL
-            bool is_intrin = msvc_header && std::find(msvc_intrinsics.begin(), msvc_intrinsics.end(), filename) !=
+            bool is_intrin = msvc_header && std::find(msvc_intrinsics.begin(), msvc_intrinsics.end(), filename_lower) !=
                                                 msvc_intrinsics.end();
-            is_intrin = is_intrin || (!msvc_header && filename == "softintrin.h"); // part of the Windows SDK
+            is_intrin = is_intrin || (!msvc_header && filename_lower == "softintrin.h"); // part of the Windows SDK
 
             // MSSTL headers exist only in the immediate (top-level) directory of the include path
             bool is_stl = !is_intrin && msvc_header && rel.parent_path().empty() &&
@@ -480,13 +491,13 @@ void add_include_files(const fs::path &src_dir, add_include_files_args args, boo
             {
                 auto &target_root = args.include_root.dir().subfiles[args.cxx_pos].dir().subfiles[args.msstl_pos];
                 // MSSTL do not need to lowercase #include directives, but only normalize line endings to LF.
-                add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
+                add_file_to_tree(target_root, std::move(path), rel, vfile::copy_mode::normalize_text);
             }
             else if (is_intrin)
             {
                 // intrins headers are conflicting with clang, so we put them in a separate directory
                 auto &target_root = args.include_root.dir().subfiles[args.intrin_pos];
-                add_file_to_tree(target_root, std::move(path), std::move(parts), vfile::copy_mode::normalize_text);
+                add_file_to_tree(target_root, std::move(path), rel, vfile::copy_mode::normalize_text);
             }
             else
             {
@@ -495,7 +506,7 @@ void add_include_files(const fs::path &src_dir, add_include_files_args args, boo
                 // They are typically 60 MiB or 80 MiB depending on the Windows SDK version
                 auto mode = ((!cppwinrt) && is_c_cxx_source(path)) ? vfile::copy_mode::lowercase_include
                                                                    : vfile::copy_mode::normal;
-                add_file_to_tree(target_root, std::move(path), std::move(parts), mode);
+                add_file_to_tree(target_root, std::move(path), rel, mode);
             }
         }
         print_and_exit_if(ec, "Error accessing file %s: %s\n", entry.path().string().c_str(), ec.message().c_str());
