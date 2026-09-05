@@ -580,7 +580,7 @@ vfile make_vfile_tree(const fs::path &out, const fs::path &sdkinc, const fs::pat
     add_architecture_libs(arch_args, "x86", "i686");
 
     vfile &modules_node = get_or_create_subdir(root.dir().subfiles[share_pos], "msvcstl");
-    add_files(msvc / "modules", modules_node, vfile::copy_mode::normalize_text);
+    add_files(msvc / "modules", modules_node, vfile::copy_mode::normal);
 
     add_include_files_args include_args{root.dir().subfiles[include_pos], cxx_pos, msstl_pos, intrin_pos};
 
