@@ -355,7 +355,8 @@ void write_sysroot_par_impl(vfile &node, const fs::path &current_path, std::size
 
         vfile *seg_end = std::find_if_not(data, end, [](const vfile &v) { return v.type() == vfile::file_type::file; });
         std::size_t seg_len = seg_end - data;
-        std::size_t num_threads = std::min(threads_count, seg_len);
+        // limit the number of threads to avoid creating too many threads for small segments
+        std::size_t num_threads = std::max(std::size_t(1), std::min(threads_count, seg_len / 8));
 
         auto process_one = [&current_path](vfile &v) { process_file(v, current_path / v.name); };
 
