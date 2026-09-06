@@ -276,7 +276,7 @@ void process_file(vfile &file_node, const fs::path &current_path)
     }
     case vfile::copy_mode::create_symlink: {
         std::error_code ec;
-        fs::create_symlink(fs::absolute(file_node.file().source), current_path, ec);
+        fs::create_symlink(file_node.file().source, current_path, ec);
         print_and_exit_if(ec, "Failed to create symlink from %s to %s: %s\n", file_node.file().source.string().c_str(),
                           current_path.string().c_str(), ec.message().c_str());
         break;
